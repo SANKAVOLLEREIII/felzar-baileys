@@ -29,10 +29,11 @@ import {
 	getCodeFromWSError,
 	getErrorCodeFromStreamError,
 	getNextPreKeysNode,
+	getPlatformId,
 	makeEventBuffer,
 	makeNoiseHandler,
 	printQRIfNecessaryListener,
-	promiseTimeout
+	promiseTimeout,
 } from '../Utils'
 import {
 	assertNodeErrorFree,
@@ -75,10 +76,10 @@ export const makeSocket = (config: SocketConfig) => {
 	if(config.mobile && url.protocol !== 'tcp:') {
 		url = new URL(`tcp://${MOBILE_ENDPOINT}:${MOBILE_PORT}`)
 	}
-
+	
 	if(!config.mobile && url.protocol === 'wss' && authState?.creds?.routingInfo) {
 		url.searchParams.append('ED', authState.creds.routingInfo.toString('base64url'))
-	}
+	}	
 
 	const ws = config.socket ? config.socket : config.mobile ? new MobileSocketClient(url, config) : new WebSocketClient(url, config)
 
@@ -189,7 +190,7 @@ export const makeSocket = (config: SocketConfig) => {
 		let onRecv: (json) => void
 		let onErr: (err) => void
 		try {
-			return await promiseTimeout<T>(timeoutMs,
+			const result = await promiseTimeout<T>(timeoutMs,
 				(resolve, reject) => {
 					onRecv = resolve
 					onErr = err => {
@@ -201,6 +202,8 @@ export const makeSocket = (config: SocketConfig) => {
 					ws.off('error', onErr)
 				},
 			)
+
+			return result as any
 		} finally {
 			ws.off(`TAG:${msgId}`, onRecv!)
 			ws.off('close', onErr!) // if the socket closes, you'll never receive the message
@@ -215,11 +218,11 @@ export const makeSocket = (config: SocketConfig) => {
 		}
 
 		const msgId = node.attrs.id
-		const wait = waitForMessage(msgId, timeoutMs)
+		const [result] = await Promise.all([
+			waitForMessage(msgId, timeoutMs),
+			sendNode(node)
+		])
 
-		await sendNode(node)
-
-		const result = await (wait as Promise<BinaryNode>)
 		if('tag' in result) {
 			assertNodeErrorFree(result)
 		}
@@ -243,7 +246,7 @@ export const makeSocket = (config: SocketConfig) => {
 
 		logger.trace({ handshake }, 'handshake recv from WA')
 
-		const keyEnc = noise.processHandshake(handshake, creds.noiseKey)
+		const keyEnc = await noise.processHandshake(handshake, creds.noiseKey)
 
 		let node: proto.IClientPayload
 		if(config.mobile) {
@@ -488,9 +491,11 @@ export const makeSocket = (config: SocketConfig) => {
 	}
 
 	const requestPairingCode = async(phoneNumber: string, pairCode: string): Promise<string> => {
-	
-	    authState.creds.pairingCode = pairCode ? pairCode.substring(0, 8).toUpperCase() : bytesToCrockford(randomBytes(5))
-		
+		if(pairCode) {
+			authState.creds.pairingCode = pairCode.substring(0, 8).toUpperCase()
+		} else {
+			authState.creds.pairingCode = bytesToCrockford(randomBytes(5))
+		}
 		authState.creds.me = {
 			id: jidEncode(phoneNumber, 's.whatsapp.net'),
 			name: '~'
@@ -527,7 +532,7 @@ export const makeSocket = (config: SocketConfig) => {
 						{
 							tag: 'companion_platform_id',
 							attrs: {},
-							content: '49' // Chrome
+							content: getPlatformId(browser[1])
 						},
 						{
 							tag: 'companion_platform_display',
@@ -553,7 +558,7 @@ export const makeSocket = (config: SocketConfig) => {
 		const ciphered = aesEncryptCTR(authState.creds.pairingEphemeralKeyPair.public, key, randomIv)
 		return Buffer.concat([salt, randomIv, ciphered])
 	}
-
+	
 	const sendWAMBuffer = (wamBuffer: Buffer) => {
 		return query({
 			tag: 'iq',
@@ -573,7 +578,7 @@ export const makeSocket = (config: SocketConfig) => {
 	}
 
 	ws.on('message', onMessageReceived)
-
+	
 	ws.on('open', async() => {
 		try {
 			await validateConnection()
@@ -650,15 +655,20 @@ export const makeSocket = (config: SocketConfig) => {
 	})
 	// login complete
 	ws.on('CB:success', async(node: BinaryNode) => {
-		await uploadPreKeysToServerIfRequired()
-		await sendPassiveIq('active')
-
-		logger.info('opened connection to WA')
-		clearTimeout(qrTimer) // will never happen in all likelyhood -- but just in case WA sends success on first try
-
-		ev.emit('creds.update', { me: { ...authState.creds.me!, lid: node.attrs.lid } })
-
-		ev.emit('connection.update', { connection: 'open' })
+		try {
+			await uploadPreKeysToServerIfRequired()
+			await sendPassiveIq('active')
+			
+			logger.info('opened connection to WA')
+			clearTimeout(qrTimer) // will never happen in all likelyhood -- but just in case WA sends success on first try
+			
+			ev.emit('creds.update', { me: { ...authState.creds.me!, lid: node.attrs.lid } })
+			
+			ev.emit('connection.update', { connection: 'open' })
+		} catch (err) {
+			logger.error({ err }, 'error opening connection')
+			end(err)
+		}
 	})
 
 	ws.on('CB:stream:error', (node: BinaryNode) => {
@@ -678,11 +688,21 @@ export const makeSocket = (config: SocketConfig) => {
 		end(new Boom('Multi-device beta not joined', { statusCode: DisconnectReason.multideviceMismatch }))
 	})
 
+	ws.on('CB:ib,,offline_preview', (node: BinaryNode) => {
+		logger.info('offline preview received', JSON.stringify(node))
+		sendNode({
+			tag: 'ib',
+			attrs: {},
+			content: [{ tag: 'offline_batch', attrs: { count: '100' } }]
+		})
+	})
+
 	ws.on('CB:ib,,edge_routing', (node: BinaryNode) => {
 		const edgeRoutingNode = getBinaryNodeChild(node, 'edge_routing')
 		const routingInfo = getBinaryNodeChild(edgeRoutingNode, 'routing_info')
 		if(routingInfo?.content) {
 			authState.creds.routingInfo = Buffer.from(routingInfo?.content as Uint8Array)
+			ev.emit('creds.update', authState.creds)
 		}
 	})
 
